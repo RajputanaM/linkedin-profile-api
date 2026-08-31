@@ -1,40 +1,52 @@
 # LinkedIn Profile API
 
 A hosted HTTPS API that takes a LinkedIn profile URL and returns structured JSON
-(name, headline, location, about, experience, education, skills, certifications,
-languages, profile images).
+(name, headline, location, about, current company, experience, education, skills,
+certifications, languages, connection info, and profile/background images).
 
-It works by directly calling LinkedIn's own internal "Voyager" REST API — the
-same undocumented endpoints linkedin.com's web frontend calls when you view a
-profile — rather than using a browser or any official LinkedIn API (there isn't
-one that exposes this data for arbitrary profiles).
+It works by directly calling LinkedIn's own internal **mwlite** (mobile web
+lite) endpoint — a lightweight, fully server-rendered profile page LinkedIn
+serves to mobile browsers — and parsing the returned HTML. No browser
+automation (Selenium/Playwright/Puppeteer) is used anywhere; this is a plain
+HTTP GET plus HTML parsing.
 
 ## How it works (approach)
 
-LinkedIn's web app authenticates a browser session with two cookies (`li_at` and
-`JSESSIONID`) and calls REST endpoints under `/voyager/api/...`, echoing the
-`JSESSIONID` value back as a `csrf-token` header on every request. Once you hold
-a valid `li_at` + `JSESSIONID` pair from a logged-in session, you can call those
-same endpoints with plain HTTP requests — no browser required.
-
-The core endpoint this service uses is:
+LinkedIn's primary web app now renders profile pages through a proprietary
+client-side "SDUI" (server-driven UI) screen protocol, which is not a plain
+data endpoint and would require reverse-engineering an undocumented streaming
+format. Instead, this service targets a simpler, confirmed-working surface:
+LinkedIn's `mwlite` endpoint.
 
 ```
-GET https://www.linkedin.com/voyager/api/identity/profiles/{publicIdentifier}/profileView
+GET https://www.linkedin.com/mwlite/profile/in/{publicIdentifier}
 ```
 
-This single call returns a combined payload — summary, positions, education,
-skills, certifications, languages, and profile picture data — structured as a
-flat, JSON:API-style entity graph (an `included[]` array of typed objects, each
-tagged with a `$type`, rather than a nested tree). [src/linkedin/parseProfile.ts](src/linkedin/parseProfile.ts)
-cross-references that graph by `$type` to build the clean response schema below.
+This page is served with `<meta id="config" data-app-id="profile-ssr-frontend" ...>`
+— i.e. it's **server-side rendered**: the complete HTML response already
+contains the profile's data (name, headline, experience, education, skills,
+etc.) baked into semantic markup. No JavaScript execution is needed to see
+it, which is what makes a plain HTTP client sufficient.
 
-**Why we don't automate login.** Automating LinkedIn's login form is the single
-most heavily monitored action on the platform (CAPTCHA / "unusual activity"
-checkpoints), especially from a server/datacenter IP. Instead, this service
-expects you to log in manually once in a normal browser and hand it the
-resulting session cookies as secrets — see Setup below. It never stores or
-touches your password.
+Two things matter for LinkedIn to actually serve this lightweight version
+instead of redirecting to the full desktop app:
+1. **Session cookies** (`li_at` + `JSESSIONID`) from a logged-in account.
+2. **A mobile User-Agent.** LinkedIn decides which experience to render based
+   on the client's User-Agent; this was confirmed by direct testing — a
+   desktop UA does not reliably get routed to `mwlite`. [src/linkedin/session.ts](src/linkedin/session.ts)
+   pins a specific mobile Chrome/Android UA string for this reason. Don't
+   change it without re-verifying against a live request.
+
+[src/linkedin/parseProfile.ts](src/linkedin/parseProfile.ts) then parses that HTML with `cheerio`
+(a jQuery-style HTML parser — still not a browser) using CSS-selector-based
+field extraction, cross-checked against a real captured profile page.
+
+**Why we don't automate login.** Automating LinkedIn's login form is one of
+the most heavily monitored actions on the platform (CAPTCHA / "unusual
+activity" checkpoints), especially from a server/datacenter IP. Instead, this
+service expects you to log in manually once in a normal browser and hand it
+the resulting session cookies as secrets — see Setup below. It never stores
+or touches your password.
 
 ## API
 
@@ -51,14 +63,17 @@ touches your password.
 { "url": "https://www.linkedin.com/in/some-person/" }
 ```
 
-**Response `200`**
+**Response `200`** (fields are `null`/empty when not present on the profile)
 ```json
 {
   "publicIdentifier": "some-person",
   "name": "Jane Doe",
   "headline": "Senior Engineer at Example Co.",
   "location": "San Francisco, California, United States",
-  "about": "...",
+  "about": null,
+  "currentCompany": "Example Co.",
+  "connectionDegree": "2nd",
+  "connectionsCount": "500+ connections",
   "profileImageUrl": "https://media.licdn.com/...",
   "backgroundImageUrl": "https://media.licdn.com/...",
   "experience": [
@@ -66,8 +81,8 @@ touches your password.
       "title": "Senior Engineer",
       "company": "Example Co.",
       "location": "San Francisco, CA",
-      "startDate": "2021-03",
-      "endDate": null,
+      "startDate": "Mar 2021",
+      "endDate": "Present",
       "description": "..."
     }
   ],
@@ -76,13 +91,14 @@ touches your password.
       "school": "State University",
       "degree": "B.S.",
       "field": "Computer Science",
-      "startDate": "2013",
-      "endDate": "2017"
+      "grade": "3.9",
+      "startDate": null,
+      "endDate": null
     }
   ],
   "skills": ["TypeScript", "Distributed Systems"],
   "certifications": [
-    { "name": "AWS Certified Solutions Architect", "issuer": "AWS", "issueDate": "2022" }
+    { "name": "AWS Certified Solutions Architect", "issuer": "AWS", "issueDate": null }
   ],
   "languages": [{ "name": "English", "proficiency": "Native or bilingual" }]
 }
@@ -136,12 +152,11 @@ npm install
 npm run dev        # runs src/server.ts with auto-reload
 ```
 
-### 4. (Optional) Capture a real payload to sanity-check the parser
+### 4. (Optional) Capture a real profile to sanity-check the parser
 
-LinkedIn's Voyager payload shape isn't documented and can drift. This script
-fetches the raw response for one profile and saves it to a local JSON file so
-you can compare it against [src/linkedin/parseProfile.ts](src/linkedin/parseProfile.ts)'s field
-assumptions:
+LinkedIn's mwlite markup isn't documented and can drift. This script fetches
+the raw HTML for one profile, saves it locally, and prints the parsed JSON so
+you can compare against [src/linkedin/parseProfile.ts](src/linkedin/parseProfile.ts)'s selectors:
 
 ```bash
 npm run capture -- <publicIdentifier>   # the slug from linkedin.com/in/<publicIdentifier>
@@ -169,8 +184,8 @@ LinkedIn account. To keep that account safe:
 - The endpoint is gated behind `x-api-key` — it isn't an open scraping proxy.
 - An in-process rate limiter (`LINKEDIN_RATE_LIMIT_PER_MINUTE`, default 6/min)
   caps outbound calls to LinkedIn regardless of how many clients call the API.
-- Outbound requests use realistic browser-like headers (user-agent,
-  accept-language) to blend in with normal traffic.
+- Outbound requests use a consistent, realistic mobile browser User-Agent to
+  match the traffic pattern LinkedIn's own mobile web users generate.
 
 ## Known limitations
 
@@ -180,11 +195,19 @@ LinkedIn account. To keep that account safe:
 - **Data completeness depends on your account's relationship to the target
   profile.** LinkedIn shows more detail to 1st/2nd-degree connections; some
   fields may come back `null` or empty for distant or restricted profiles.
-- **The Voyager payload shape is undocumented and can change.** This service
-  targets the `profileView` endpoint's shape as currently observed; if
-  LinkedIn migrates a section to its newer GraphQL surface, that section may
-  come back empty until [src/linkedin/parseProfile.ts](src/linkedin/parseProfile.ts) is updated against a
-  fresh captured payload (see Setup step 4).
+- **Two sections are best-effort / unverified against real markup:** "About"
+  and "Languages". The test profile used to build this parser had neither
+  filled in, so their selectors in [src/linkedin/parseProfile.ts](src/linkedin/parseProfile.ts) follow the
+  same structural conventions LinkedIn uses elsewhere on the page but haven't
+  been confirmed against a real example. If you hit a profile with either
+  section populated, run the capture script and adjust the selectors if
+  needed.
+- **Profiles without a custom photo** return LinkedIn's shared placeholder
+  asset URL for `profileImageUrl`/`backgroundImageUrl` rather than `null` —
+  this mirrors what a real viewer would see.
+- **The mwlite markup is undocumented and can change** without notice; if
+  fields start coming back empty, recapture a live profile and diff against
+  the current selectors.
 - **No CAPTCHA/2FA/checkpoint handling.** If the account behind the cookies
   gets flagged, that has to be resolved manually in a browser.
 - **Rate limits are intentionally conservative**, prioritizing account safety

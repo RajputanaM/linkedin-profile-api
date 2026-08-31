@@ -1,7 +1,7 @@
 import { Router } from "express";
 import { extractPublicIdentifier, InvalidProfileUrlError } from "../linkedin/urlUtils";
-import { fetchProfileView, LinkedInAuthError, ProfileNotFoundError } from "../linkedin/voyagerClient";
-import { parseProfileView } from "../linkedin/parseProfile";
+import { fetchProfileHtml, LinkedInAuthError, ProfileNotFoundError } from "../linkedin/mwliteClient";
+import { parseProfileHtml } from "../linkedin/parseProfile";
 
 export const profileRouter = Router();
 
@@ -25,8 +25,8 @@ profileRouter.post("/profile", async (req, res) => {
   }
 
   try {
-    const raw = await fetchProfileView(publicIdentifier);
-    const profile = parseProfileView(raw, publicIdentifier);
+    const html = await fetchProfileHtml(publicIdentifier);
+    const profile = parseProfileHtml(html, publicIdentifier);
     res.status(200).json(profile);
   } catch (err) {
     if (err instanceof ProfileNotFoundError) {

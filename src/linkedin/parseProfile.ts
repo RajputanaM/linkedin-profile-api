@@ -1,20 +1,19 @@
-/**
- * The Voyager `profileView` response is a JSON:API-style entity graph: a flat
- * `included[]` array of typed entities (each tagged with a `$type`), rather
- * than a nested object tree. This file cross-references those entities by
- * `$type` to build our clean, flat response schema.
- *
- * IMPORTANT: the exact field names here are based on the documented shape of
- * this (undocumented, reverse-engineered) endpoint and WILL need to be
- * checked/adjusted against a real captured payload — see
- * `scripts/capture-profile.ts` and the README "Approach" section. LinkedIn
- * changes these payloads without notice.
- */
+import * as cheerio from "cheerio";
+import type { CheerioAPI, Cheerio } from "cheerio";
+import type { Element } from "domhandler";
 
-interface VoyagerEntity {
-  $type?: string;
-  [key: string]: unknown;
-}
+/**
+ * Parses LinkedIn's "mwlite" server-rendered profile HTML. Field selectors
+ * below were derived from a real captured page (see scripts/capture-profile.ts)
+ * for a profile that had: name/headline/company/location, full experience,
+ * education, skills, and certifications/publications under "Accomplishments".
+ *
+ * Two sections are best-effort / UNVERIFIED against real markup because the
+ * test profile didn't have them filled in: "About" and "Languages". Their
+ * selectors follow the same structural conventions LinkedIn uses elsewhere on
+ * this page, but should be re-checked against a profile that actually has
+ * those sections before relying on them.
+ */
 
 export interface ParsedProfile {
   publicIdentifier: string;
@@ -22,6 +21,9 @@ export interface ParsedProfile {
   headline: string | null;
   location: string | null;
   about: string | null;
+  currentCompany: string | null;
+  connectionDegree: string | null;
+  connectionsCount: string | null;
   profileImageUrl: string | null;
   backgroundImageUrl: string | null;
   experience: ExperienceEntry[];
@@ -44,6 +46,7 @@ export interface EducationEntry {
   school: string | null;
   degree: string | null;
   field: string | null;
+  grade: string | null;
   startDate: string | null;
   endDate: string | null;
 }
@@ -59,86 +62,217 @@ export interface LanguageEntry {
   proficiency: string | null;
 }
 
-function getIncluded(raw: unknown): VoyagerEntity[] {
-  const included = (raw as { included?: unknown })?.included;
-  return Array.isArray(included) ? (included as VoyagerEntity[]) : [];
+function textOrNull($el: Cheerio<Element>): string | null {
+  const text = $el.first().text().trim().replace(/\s+/g, " ");
+  return text.length > 0 ? text : null;
 }
 
-function entitiesOfType(entities: VoyagerEntity[], typeSuffix: string): VoyagerEntity[] {
-  return entities.filter((e) => typeof e.$type === "string" && e.$type.endsWith(typeSuffix));
+// Start-date spans in this markup embed the range separator inside the same
+// element, e.g. `<span>Feb 2026\n-\n</span><span>Present</span>`, so the
+// collapsed text comes back as "Feb 2026 -". Strip the trailing separator.
+function stripTrailingDash(text: string | null): string | null {
+  if (!text) return text;
+  const stripped = text.replace(/\s*-\s*$/, "").trim();
+  return stripped.length > 0 ? stripped : null;
 }
 
-function str(value: unknown): string | null {
-  return typeof value === "string" && value.length > 0 ? value : null;
+function findSectionByHeading($: CheerioAPI, heading: string): Cheerio<Element> | null {
+  let found: Cheerio<Element> | null = null;
+  $("section").each((_, el) => {
+    const $el = $(el);
+    const h2Text = $el.children("h2").first().text().trim();
+    if (h2Text === heading) {
+      found = $el;
+      return false;
+    }
+    return undefined;
+  });
+  return found;
 }
 
-function formatDate(dateObj: unknown): string | null {
-  if (!dateObj || typeof dateObj !== "object") return null;
-  const { month, year } = dateObj as { month?: number; year?: number };
-  if (!year) return null;
-  return month ? `${year}-${String(month).padStart(2, "0")}` : String(year);
+function parseHeader($: CheerioAPI): {
+  name: string | null;
+  headline: string | null;
+  location: string | null;
+  currentCompany: string | null;
+  connectionDegree: string | null;
+  connectionsCount: string | null;
+} {
+  const nameEl = $("h1.heading-large").first();
+  const header = nameEl.closest("div.bg-color-background-container.mx-2.mt-2.mb-1");
+
+  const name = textOrNull(nameEl);
+  const connectionDegree = textOrNull(header.find('span[title$="degree connection"]'));
+  const headline = textOrNull(header.find("> div.body-small.text-color-text > span").first());
+  const currentCompany = textOrNull(header.find("span.member-current-company"));
+  const connectionsCount = textOrNull(header.find("span.whitespace-nowrap"));
+
+  const locationDivs = header.find("> div.body-small.text-color-text-low-emphasis");
+  let location: string | null = null;
+  locationDivs.each((_, el) => {
+    const $el = $(el);
+    if ($el.find(".member-current-company").length === 0) {
+      const clone = $el.clone();
+      clone.find(".whitespace-nowrap, .dot-separator").remove();
+      location = clone.text().trim().replace(/\s+/g, " ") || null;
+    }
+  });
+
+  return { name, headline, location, currentCompany, connectionDegree, connectionsCount };
 }
 
-// LinkedIn image fields use a vector-image format: a root CDN URL plus a list
-// of resolution "artifacts". We pick the highest-resolution artifact available.
-function resolveImageUrl(imageField: unknown): string | null {
-  const vectorImage = (imageField as any)?.displayImageReference?.vectorImage ?? (imageField as any)?.vectorImage;
-  if (!vectorImage?.rootUrl || !Array.isArray(vectorImage.artifacts)) return null;
-
-  const best = [...vectorImage.artifacts].sort(
-    (a, b) => (b.width ?? 0) - (a.width ?? 0)
-  )[0];
-  if (!best?.fileIdentifyingUrlPathSegment) return null;
-
-  return `${vectorImage.rootUrl}${best.fileIdentifyingUrlPathSegment}`;
+function parseAbout($: CheerioAPI): string | null {
+  // UNVERIFIED: no real profile with an About section was available while
+  // building this. Falls back to "all text in the section besides the
+  // heading" since that's the pattern LinkedIn uses for most other sections.
+  const section = findSectionByHeading($, "About");
+  if (!section) return null;
+  const clone = section.clone();
+  clone.children("h2").remove();
+  clone.find("button").remove();
+  return textOrNull(clone as Cheerio<Element>);
 }
 
-export function parseProfileView(raw: unknown, publicIdentifier: string): ParsedProfile {
-  const included = getIncluded(raw);
+function parseImages($: CheerioAPI): { profileImageUrl: string | null; backgroundImageUrl: string | null } {
+  const profileImageUrl =
+    $("#profile-picture-container img").first().attr("data-delayed-url") ?? null;
+  const backgroundImageUrl =
+    $('img[aria-label="Member Background Photo"]').first().attr("data-delayed-url") ?? null;
+  return { profileImageUrl, backgroundImageUrl };
+}
 
-  const profileEntity = entitiesOfType(included, "identity.profile.Profile")[0];
-  const positions = entitiesOfType(included, "identity.profile.Position");
-  const educations = entitiesOfType(included, "identity.profile.Education");
-  const skills = entitiesOfType(included, "identity.profile.Skill");
-  const certifications = entitiesOfType(included, "identity.profile.Certification");
-  const languages = entitiesOfType(included, "identity.profile.Language");
+function parseExperience($: CheerioAPI): ExperienceEntry[] {
+  const section = findSectionByHeading($, "Experience");
+  if (!section) return [];
 
-  const firstName = str(profileEntity?.firstName);
-  const lastName = str(profileEntity?.lastName);
-  const name = firstName || lastName ? [firstName, lastName].filter(Boolean).join(" ") : null;
+  const entries: ExperienceEntry[] = [];
+
+  section.find("> ol > li.profile-entity-lockup").each((_, companyLi) => {
+    const $companyLi = $(companyLi);
+    const company = textOrNull($companyLi.find("> a .list-item-heading span").first());
+
+    const roles = $companyLi.find(".entity-lockup-border > ul > li.role-container");
+    if (roles.length === 0) {
+      // Single-role company with no nested role list in some layouts.
+      entries.push({
+        title: company,
+        company,
+        location: null,
+        startDate: null,
+        endDate: null,
+        description: null,
+      });
+      return;
+    }
+
+    roles.each((__, roleLi) => {
+      const $role = $(roleLi);
+      const title = textOrNull($role.find(".body-small-bold span").first());
+      const dateSpans = $role.find("div.body-small.text-color-text > span.body-small");
+      const startDate = stripTrailingDash(textOrNull(dateSpans.eq(0)));
+      const endDate = textOrNull(dateSpans.eq(1));
+      const location = textOrNull($role.find(".text-xs.text-color-text-low-emphasis span").first());
+      const description = textOrNull($role.find(".description").first());
+
+      entries.push({ title, company, location, startDate, endDate, description });
+    });
+  });
+
+  return entries;
+}
+
+function parseEducation($: CheerioAPI): EducationEntry[] {
+  const section = findSectionByHeading($, "Education");
+  if (!section) return [];
+
+  const entries: EducationEntry[] = [];
+
+  section.find("> ol > li").each((_, li) => {
+    const $li = $(li);
+    const school = textOrNull($li.find(".list-item-heading span").first());
+
+    const degreeFieldSpans = $li.find("div.body-small.text-color-text > span");
+    const degree = textOrNull(degreeFieldSpans.eq(0));
+    const field = textOrNull(degreeFieldSpans.eq(2)); // index 1 is the dot-separator
+
+    const grade = textOrNull($li.find('div.body-small.mt-1.text-color-text span[dir="ltr"]').first());
+
+    // UNVERIFIED: dates weren't populated on the test profile's education
+    // entry. Attempting the same two-span pattern used for experience dates.
+    const dateSpans = $li.find("div.body-small.text-color-text-low-emphasis span.body-small");
+    const startDate = stripTrailingDash(textOrNull(dateSpans.eq(0)));
+    const endDate = textOrNull(dateSpans.eq(1));
+
+    entries.push({ school, degree, field, grade, startDate, endDate });
+  });
+
+  return entries;
+}
+
+function parseSkills($: CheerioAPI): string[] {
+  const skills: string[] = [];
+  $(".skills-list .skill-item span[dir='ltr']").each((_, el) => {
+    const text = textOrNull($(el));
+    if (text) skills.push(text);
+  });
+  return skills;
+}
+
+function parseAccomplishmentList(
+  $: CheerioAPI,
+  sectionClass: string
+): { name: string | null; detail: string | null; date: string | null }[] {
+  const results: { name: string | null; detail: string | null; date: string | null }[] = [];
+  $(`.accomplishment-type.${sectionClass} ul > li.sub-list-item`).each((_, li) => {
+    const $li = $(li);
+    const name = textOrNull($li.find(".list-item-heading").first());
+    const detail = textOrNull($li.find(".description").first());
+    const date = textOrNull($li.find(".date").first());
+    results.push({ name, detail, date });
+  });
+  return results;
+}
+
+function parseCertifications($: CheerioAPI): CertificationEntry[] {
+  return parseAccomplishmentList($, "certifications-section").map((c) => ({
+    name: c.name,
+    issuer: c.detail,
+    issueDate: c.date,
+  }));
+}
+
+function parseLanguages($: CheerioAPI): LanguageEntry[] {
+  // UNVERIFIED: the test profile had no Languages entries. This assumes the
+  // same "accomplishment-type" structure used for Certifications/Publications
+  // (class would be "languages-section") — confirm against a real profile
+  // that lists languages and adjust if the class name or field mapping differs.
+  return parseAccomplishmentList($, "languages-section").map((l) => ({
+    name: l.name,
+    proficiency: l.detail,
+  }));
+}
+
+export function parseProfileHtml(html: string, publicIdentifier: string): ParsedProfile {
+  const $ = cheerio.load(html);
+
+  const header = parseHeader($);
+  const { profileImageUrl, backgroundImageUrl } = parseImages($);
 
   return {
     publicIdentifier,
-    name,
-    headline: str(profileEntity?.headline),
-    location: str(profileEntity?.geoLocationName) ?? str(profileEntity?.locationName),
-    about: str(profileEntity?.summary),
-    profileImageUrl: resolveImageUrl(profileEntity?.profilePicture),
-    backgroundImageUrl: resolveImageUrl(profileEntity?.backgroundImage),
-    experience: positions.map((p) => ({
-      title: str(p.title),
-      company: str(p.companyName),
-      location: str(p.locationName),
-      startDate: formatDate((p as any).dateRange?.start ?? (p as any).timePeriod?.startDate),
-      endDate: formatDate((p as any).dateRange?.end ?? (p as any).timePeriod?.endDate),
-      description: str(p.description),
-    })),
-    education: educations.map((e) => ({
-      school: str(e.schoolName),
-      degree: str(e.degreeName),
-      field: str(e.fieldOfStudy),
-      startDate: formatDate((e as any).dateRange?.start ?? (e as any).timePeriod?.startDate),
-      endDate: formatDate((e as any).dateRange?.end ?? (e as any).timePeriod?.endDate),
-    })),
-    skills: skills.map((s) => str(s.name)).filter((v): v is string => v !== null),
-    certifications: certifications.map((c) => ({
-      name: str(c.name),
-      issuer: str(c.authority),
-      issueDate: formatDate((c as any).timePeriod?.startDate ?? (c as any).dateRange?.start),
-    })),
-    languages: languages.map((l) => ({
-      name: str(l.name),
-      proficiency: str(l.proficiency),
-    })),
+    name: header.name,
+    headline: header.headline,
+    location: header.location,
+    about: parseAbout($),
+    currentCompany: header.currentCompany,
+    connectionDegree: header.connectionDegree,
+    connectionsCount: header.connectionsCount,
+    profileImageUrl,
+    backgroundImageUrl,
+    experience: parseExperience($),
+    education: parseEducation($),
+    skills: parseSkills($),
+    certifications: parseCertifications($),
+    languages: parseLanguages($),
   };
 }

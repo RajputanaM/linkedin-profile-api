@@ -1,8 +1,7 @@
 /**
- * Dev-only helper: fetches the raw Voyager profileView payload for a given
- * public identifier and writes it to captured-<identifier>.json so we can
- * inspect the real field shapes and refine src/linkedin/parseProfile.ts
- * against actual data instead of guessing.
+ * Dev-only helper: fetches the raw mwlite profile HTML for a given public
+ * identifier and writes it to captured-<identifier>.html so we can inspect
+ * real markup and refine src/linkedin/parseProfile.ts against actual data.
  *
  * Usage:
  *   npm run capture -- <publicIdentifier>
@@ -11,7 +10,8 @@
  * Requires LI_AT_COOKIE and JSESSIONID to be set in .env first.
  */
 import { writeFileSync } from "fs";
-import { fetchProfileView } from "../src/linkedin/voyagerClient";
+import { fetchProfileHtml } from "../src/linkedin/mwliteClient";
+import { parseProfileHtml } from "../src/linkedin/parseProfile";
 
 async function main() {
   const publicIdentifier = process.argv[2];
@@ -20,10 +20,13 @@ async function main() {
     process.exit(1);
   }
 
-  const data = await fetchProfileView(publicIdentifier);
-  const outPath = `captured-${publicIdentifier}.json`;
-  writeFileSync(outPath, JSON.stringify(data, null, 2));
-  console.log(`Wrote raw payload to ${outPath}`);
+  const html = await fetchProfileHtml(publicIdentifier);
+  const outPath = `captured-${publicIdentifier}.html`;
+  writeFileSync(outPath, html);
+  console.log(`Wrote raw HTML to ${outPath}`);
+
+  const parsed = parseProfileHtml(html, publicIdentifier);
+  console.log(JSON.stringify(parsed, null, 2));
 }
 
 main().catch((err) => {
